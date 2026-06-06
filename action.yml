@@ -1,0 +1,308 @@
+name: "Verbaria source sync"
+description: >-
+  Push a repository's SOURCE locale to a Verbaria server with the Verbaria CLI,
+  generate a git commit message + Markdown changelog from the verbaria-lock.json
+  diff, and open (or update) a pull request with the updated lock. Does nothing
+  when the source is unchanged, and skips when a source PR is already open.
+author: "Verbaria"
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  server-url:
+    description: "Verbaria server URL (e.g. https://translate.example.org/)."
+    required: true
+  username:
+    description: "Verbaria username."
+    required: true
+  api-key:
+    description: "Verbaria API key (store as a secret)."
+    required: true
+  project-config:
+    description: "Path to the project config (verbaria.json), relative to working-directory."
+    required: false
+    default: "verbaria.json"
+  working-directory:
+    description: "Directory to run the sync in (where verbaria.json lives)."
+    required: false
+    default: "."
+  push-type:
+    description: "What to push: source or both."
+    required: false
+    default: "source"
+  push-args:
+    description: "Extra arguments passed verbatim to `verbaria push`."
+    required: false
+    default: ""
+
+  client-repo:
+    description: "GitHub repo (owner/name) that publishes the Verbaria CLI release archive."
+    required: false
+    default: "verbaria/verbaria"
+  client-version:
+    description: "CLI release tag to download, or 'latest'."
+    required: false
+    default: "latest"
+  client-download-url:
+    description: "Explicit URL to a verbaria-*.tar.gz archive (overrides client-repo/version)."
+    required: false
+    default: ""
+  java-version:
+    description: "JDK version to run the CLI with."
+    required: false
+    default: "25"
+  java-distribution:
+    description: "JDK distribution for actions/setup-java."
+    required: false
+    default: "temurin"
+
+  branch:
+    description: "Head branch used for the source PR."
+    required: false
+    default: "verbaria/source"
+  base-branch:
+    description: "Base branch for the PR (defaults to the repository default branch)."
+    required: false
+    default: ""
+  pr-title:
+    description: "Title of the pull request."
+    required: false
+    default: "chore(i18n): sync source"
+  pr-labels:
+    description: "Comma-separated labels applied to the PR."
+    required: false
+    default: "source"
+  commit-author-name:
+    description: "Git author name for the sync commit."
+    required: false
+    default: "verbaria-bot"
+  commit-author-email:
+    description: "Git author email for the sync commit."
+    required: false
+    default: "verbaria-bot@users.noreply.github.com"
+  exclude-authors:
+    description: >-
+      Author names/emails to drop from the changelog Co-authored-by trailers
+      (comma/space separated). Defaults to the bot's own commit identity so it
+      never credits itself for source it merely pushed.
+    required: false
+    default: ""
+  github-token:
+    description: "Token used to download the CLI release and open the PR."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  changed:
+    description: "'true' when the source changed and a PR was created/updated."
+    value: ${{ steps.commit.outputs.changed }}
+  skipped:
+    description: "'true' when an open source PR already existed and the run was skipped."
+    value: ${{ steps.check-pr.outputs.skip }}
+  pr-url:
+    description: "URL of the created/updated pull request (empty when nothing changed)."
+    value: ${{ steps.commit.outputs.pr-url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up JDK ${{ inputs.java-version }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: ${{ inputs.java-distribution }}
+        java-version: ${{ inputs.java-version }}
+
+    - name: Download Verbaria CLI
+      id: cli
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        dest="$RUNNER_TEMP/verbaria-cli"
+        mkdir -p "$dest"
+        url='${{ inputs.client-download-url }}'
+        repo='${{ inputs.client-repo }}'
+        ver='${{ inputs.client-version }}'
+        if [ -n "$url" ]; then
+          echo "Downloading CLI from explicit URL: $url"
+          curl -fSL "$url" -o "$dest/verbaria.tar.gz"
+        elif [ "$ver" = "latest" ]; then
+          # No tag => gh downloads the latest release.
+          echo "Downloading the latest CLI release from $repo"
+          gh release download --repo "$repo" \
+            --pattern 'verbaria-*.tar.gz' --dir "$dest"
+          mv "$dest"/verbaria-*.tar.gz "$dest/verbaria.tar.gz"
+        else
+          echo "Downloading CLI release '$ver' from $repo"
+          gh release download "$ver" --repo "$repo" \
+            --pattern 'verbaria-*.tar.gz' --dir "$dest"
+          mv "$dest"/verbaria-*.tar.gz "$dest/verbaria.tar.gz"
+        fi
+        tar -xzf "$dest/verbaria.tar.gz" -C "$dest"
+        bin="$(find "$dest" -type f -name verbaria -path '*/bin/*' | head -n1)"
+        if [ -z "$bin" ]; then
+          echo "::error::Could not locate the verbaria launcher in the archive"
+          exit 1
+        fi
+        chmod +x "$bin"
+        echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+        # The launcher selects its JVM from VERBARIA_JRE.
+        echo "VERBARIA_JRE=$JAVA_HOME" >> "$GITHUB_ENV"
+        echo "Using CLI at $bin"
+
+    - name: Skip if a source PR is already open
+      id: check-pr
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        open="$(gh pr list --state open --head '${{ inputs.branch }}' --json number --jq 'length')"
+        if [ "${open:-0}" != "0" ]; then
+          echo "An open source PR already exists on '${{ inputs.branch }}'; skipping."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Back up existing lock file
+      if: steps.check-pr.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        old="$RUNNER_TEMP/verbaria-lock.old.json"
+        if [ -f verbaria-lock.json ]; then
+          cp verbaria-lock.json "$old"
+          echo "Saved previous lock to $old"
+        else
+          # No previous lock: make sure the path does NOT exist, so `changelog`
+          # treats every pushed document as new (an empty file would fail to
+          # parse).
+          rm -f "$old"
+          echo "No previous lock; treating all pushed source as new."
+        fi
+
+    - name: Push source locale
+      if: steps.check-pr.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        VERBARIA_KEY: ${{ inputs.api-key }}
+      run: |
+        set -euo pipefail
+        verbaria push \
+          --url '${{ inputs.server-url }}' \
+          --username '${{ inputs.username }}' \
+          --key "$VERBARIA_KEY" \
+          --project-config '${{ inputs.project-config }}' \
+          --push-type '${{ inputs.push-type }}' \
+          --batch-mode \
+          -e \
+          ${{ inputs.push-args }}
+
+    - name: Generate changelogs from the lock diff
+      if: steps.check-pr.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        EXCLUDE_AUTHORS: ${{ inputs.exclude-authors }}
+        BOT_NAME: ${{ inputs.commit-author-name }}
+        BOT_EMAIL: ${{ inputs.commit-author-email }}
+      run: |
+        set -euo pipefail
+        old="$RUNNER_TEMP/verbaria-lock.old.json"
+        if [ ! -f verbaria-lock.json ]; then
+          echo "No verbaria-lock.json produced by push; nothing to changelog."
+          exit 0
+        fi
+        # By default the bot must not credit itself for source it merely pushed;
+        # drop its own identity from the Co-authored-by trailers.
+        excludes="$EXCLUDE_AUTHORS"
+        if [ -z "$excludes" ]; then
+          excludes="$BOT_EMAIL,$BOT_NAME"
+        fi
+        exclude_args=()
+        [ -n "$excludes" ] && exclude_args=(--exclude-author "$excludes")
+        verbaria changelog --old "$old" --new verbaria-lock.json \
+          --format git-commit --output "$RUNNER_TEMP/commit-msg.txt" \
+          "${exclude_args[@]}" || true
+        verbaria changelog --old "$old" --new verbaria-lock.json \
+          --format markdown --output "$RUNNER_TEMP/changelog.md" \
+          "${exclude_args[@]}" || true
+
+    - name: Commit changes and open PR
+      id: commit
+      if: steps.check-pr.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        echo "changed=false" >> "$GITHUB_OUTPUT"
+        echo "pr-url=" >> "$GITHUB_OUTPUT"
+
+        git config user.name  '${{ inputs.commit-author-name }}'
+        git config user.email '${{ inputs.commit-author-email }}'
+
+        git add -A
+        if git diff --cached --quiet; then
+          echo "No source changes; doing nothing."
+          exit 0
+        fi
+
+        base='${{ inputs.base-branch }}'
+        if [ -z "$base" ]; then
+          base='${{ github.ref_name }}'
+        fi
+        branch='${{ inputs.branch }}'
+
+        # Final guard against a race with the early skip step: if an OPEN PR for
+        # this branch already exists, do nothing — never force-push over it and
+        # never open a duplicate. Only an OPEN PR counts; a closed/merged one
+        # must not block a fresh sync.
+        existing="$(gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty')"
+        if [ -n "$existing" ]; then
+          echo "An open PR already exists for '$branch'; skipping (no override)."
+          echo "pr-url=$existing" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git switch -C "$branch"
+
+        msg="$RUNNER_TEMP/commit-msg.txt"
+        if [ ! -s "$msg" ]; then
+          printf 'chore(i18n): sync source\n' > "$msg"
+        fi
+        git commit -F "$msg"
+        # The branch is a dedicated, bot-owned, rebuilt-from-base branch.
+        git push --force origin "$branch"
+
+        body="$RUNNER_TEMP/changelog.md"
+        if [ ! -s "$body" ]; then
+          cp "$msg" "$body"
+        fi
+
+        labelArgs=()
+        IFS=',' read -ra labels <<< '${{ inputs.pr-labels }}'
+        for l in "${labels[@]}"; do
+          l="$(echo "$l" | xargs)"
+          [ -n "$l" ] && labelArgs+=(--label "$l")
+        done
+
+        # No open PR exists (verified above), so create one. Don't swallow the
+        # error: a create failure is usually the repo setting "Allow GitHub
+        # Actions to create and approve pull requests" being disabled (gh
+        # returns 403), and hiding it gives a confusing message instead.
+        url="$(gh pr create --base "$base" --head "$branch" \
+          --title '${{ inputs.pr-title }}' \
+          --body-file "$body" \
+          "${labelArgs[@]}")"
+
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+        echo "pr-url=$url" >> "$GITHUB_OUTPUT"
+        echo "Opened PR: $url"

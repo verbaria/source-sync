@@ -1,0 +1,36 @@
+# Example consumer workflow — copy into a project's .github/workflows/.
+name: Sync source
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'LOCALIZE-LIB/en_US/**'   # adjust to your source layout
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: verbaria-source
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: sync
+        uses: verbaria/source-sync@master
+        with:
+          server-url: https://translate.example.org/
+          username: ${{ vars.VERBARIA_USERNAME }}
+          api-key: ${{ secrets.VERBARIA_API_KEY }}
+          # push-type: source        # source | both
+          # branch: verbaria/source
+          # pr-labels: source,automated
+
+      - if: steps.sync.outputs.changed == 'true'
+        run: echo "Opened PR ${{ steps.sync.outputs.pr-url }}"
