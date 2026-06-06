@@ -72,7 +72,7 @@ inputs:
   pr-labels:
     description: "Comma-separated labels applied to the PR."
     required: false
-    default: "source"
+    default: "translations"
   commit-author-name:
     description: "Git author name for the sync commit."
     required: false
