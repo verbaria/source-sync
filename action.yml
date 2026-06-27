@@ -254,6 +254,13 @@ runs:
           echo "No source changes; doing nothing."
           exit 0
         fi
+        # The changelog ignores the volatile generatedAt timestamp: an empty
+        # commit message means only the lock timestamp moved, so nothing
+        # meaningful changed -> do not open a no-op PR.
+        if [ ! -s "$RUNNER_TEMP/commit-msg.txt" ]; then
+          echo "Only the lock timestamp moved; nothing meaningful changed. No PR."
+          exit 0
+        fi
 
         base='${{ inputs.base-branch }}'
         if [ -z "$base" ]; then
