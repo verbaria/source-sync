@@ -209,6 +209,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        VERBARIA_KEY: ${{ inputs.api-key }}
         EXCLUDE_AUTHORS: ${{ inputs.exclude-authors }}
         BOT_NAME: ${{ inputs.commit-author-name }}
         BOT_EMAIL: ${{ inputs.commit-author-email }}
@@ -227,10 +228,18 @@ runs:
         fi
         exclude_args=()
         [ -n "$excludes" ] && exclude_args=(--exclude-author "$excludes")
-        verbaria changelog --old "$old" --new verbaria-lock.json \
+        verbaria changelog \
+          --url '${{ inputs.server-url }}' \
+          --username '${{ inputs.username }}' \
+          --key "$VERBARIA_KEY" \
+          --old "$old" --new verbaria-lock.json \
           --format git-commit --output "$RUNNER_TEMP/commit-msg.txt" \
           "${exclude_args[@]}" || true
-        verbaria changelog --old "$old" --new verbaria-lock.json \
+        verbaria changelog \
+          --url '${{ inputs.server-url }}' \
+          --username '${{ inputs.username }}' \
+          --key "$VERBARIA_KEY" \
+          --old "$old" --new verbaria-lock.json \
           --format markdown --output "$RUNNER_TEMP/changelog.md" \
           "${exclude_args[@]}" || true
 
